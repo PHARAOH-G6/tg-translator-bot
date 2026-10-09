@@ -20,9 +20,8 @@ WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
 WEBHOOK_URL = f"{WEBHOOK_HOST}{WEBHOOK_PATH}"
 PORT = int(os.environ.get("PORT", 10000))
 
-# ВАЖНО: обращаемся к локальному прокси, а не к B站 напрямую
-BILIBILI_PROXY_URL = "http://127.0.0.1:8080/v1/chat/completions"
-BILIBILI_MODEL = "Index-Translate-35B-A3B"
+# KeylessAI — бесплатный OpenAI-совместимый эндпоинт
+KEYLESS_API_URL = "https://keylessai.thryx.workers.dev/v1/chat/completions"
 
 LANGUAGES = {
     "ru": "🇷🇺 Русский", "en": "🇬🇧 English", "de": "🇩🇪 Deutsch",
@@ -48,29 +47,30 @@ def lang_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
-# ---------------- ПЕРЕВОД ЧЕРЕЗ ПРОКСИ ----------------
+# ---------------- ПЕРЕВОД ЧЕРЕЗ KEYLESS AI ----------------
 
-def bilibili_translate(text: str, target_lang: str) -> str:
-    """Отправляет запрос на локальный прокси, тот — в B站."""
+def translate_keyless(text: str, target_lang: str) -> str:
+    """Перевод через KeylessAI (OpenAI-совместимый эндпоинт без ключей)."""
     prompt = (
-        f"请将以下文本翻译为{target_lang}，直接输出翻译结果，"
-        f"不要进行任何解释。\n\n{text}"
+        f"Translate the following text to {target_lang}. "
+        f"Output only the translation, without any explanations.\n\n{text}"
     )
 
     payload = {
-        "model": BILIBILI_MODEL,
+        "model": "openai-fast",
         "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0,
-        "max_tokens": 1024,
-        "chat_template_kwargs": {"enable_thinking": False}
+        "temperature": 0.3,
     }
 
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
-        BILIBILI_PROXY_URL,
+        KEYLESS_API_URL,
         data=data,
-        headers={"Content-Type": "application/json"},
-        method="POST"
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": "Bearer not-needed",
+        },
+        method="POST",
     )
 
     try:
@@ -79,18 +79,18 @@ def bilibili_translate(text: str, target_lang: str) -> str:
         return result["choices"][0]["message"]["content"].strip()
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="ignore")
-        logging.warning(f"Прокси вернул HTTP {e.code}: {body[:200]}")
+        logging.warning(f"KeylessAI HTTP {e.code}: {body[:200]}")
         return ""
     except Exception as e:
-        logging.warning(f"Ошибка обращения к прокси: {e}")
+        logging.warning(f"KeylessAI error: {e}")
         return ""
 
 
 async def get_variants(text: str, target: str):
     variants = []
-    result = await asyncio.to_thread(bilibili_translate, text, target)
+    result = await asyncio.to_thread(translate_keyless, text, target)
     if result:
-        variants.append(("Index-Translate", result))
+        variants.append(("KeylessAI", result))
     return variants
 
 
@@ -100,7 +100,7 @@ async def get_variants(text: str, target: str):
 async def cmd_start(message: Message):
     user_lang[message.from_user.id] = "en"
     await message.answer(
-        "👋 Привет! Я перевожу через <b>Bilibili Index-Translate 35B</b>.\n\n"
+        "👋 Привет! Я перевожу через <b>KeylessAI</b>.\n\n"
         "Отправь текст — получишь перевод.\n"
         "/lang — сменить язык"
     )
@@ -143,7 +143,6 @@ async def translate_message(message: Message):
         return
 
     target = user_lang.get(message.from_user.id, "en")
-    # Берём человекочитаемое имя языка для промпта
     target_name = LANGUAGES.get(target, "English").split(" ", 1)[-1]
 
     await bot.send_chat_action(message.chat.id, "typing")
