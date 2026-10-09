@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: translator-bot
+    name: tg-translator-bot
     env: python
     region: frankfurt
     plan: free
@@ -8,6 +8,4 @@ services:
     startCommand: python bot.py
     envVars:
       - key: BOT_TOKEN
-        sync: false
-      - key: DEEPL_KEY
         sync: false
