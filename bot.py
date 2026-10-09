@@ -3,6 +3,7 @@ import logging
 import os
 import json
 import urllib.request
+import urllib.error
 
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F
@@ -14,13 +15,13 @@ from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_applicati
 
 # ================== НАСТРОЙКИ ==================
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-# URL бесплатного API Bilibili Index-Translate
-BILIBILI_API_URL = "https://index-translate.bilibili.com/v1/chat/completions"
 WEBHOOK_HOST = os.environ.get("RENDER_EXTERNAL_URL", "")
 WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
 WEBHOOK_URL = f"{WEBHOOK_HOST}{WEBHOOK_PATH}"
 PORT = int(os.environ.get("PORT", 10000))
-# ===============================================
+
+BILIBILI_API = "https://index-translate.bilibili.com/v1/chat/completions"
+BILIBILI_MODEL = "Index-Translate-35B-A3B"
 
 LANGUAGES = {
     "ru": "🇷🇺 Русский", "en": "🇬🇧 English", "de": "🇩🇪 Deutsch",
@@ -46,55 +47,57 @@ def lang_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
-# ---------------- ДВИЖОК BILIBILI ----------------
+# ---------------- ЯДРО ПЕРЕВОДА ----------------
 
-def translate_bilibili(text: str, target: str) -> str | None:
-    """Перевод через бесплатный API Bilibili Index-Translate."""
+def bilibili_translate(text: str, target_lang: str) -> str:
+    """Прямой вызов бесплатного API Bilibili (с сервера, без Origin)"""
+    prompt = f"请将以下文本翻译为{target_lang}，直接输出翻译结果，不要进行任何解释。\n\n{text}"
+    
+    payload = {
+        "model": BILIBILI_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0,
+        "max_tokens": 1024,
+        "chat_template_kwargs": {"enable_thinking": False}
+    }
+    
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        BILIBILI_API,
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST"
+    )
+    
     try:
-        # Формируем промпт, как в официальном примере [citation:1]
-        prompt = f"请将以下文本翻译为{target}，直接输出翻译结果。\n\n{text}"
-        
-        payload = {
-            "model": "Index-Translate-35B-A3B",
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0,
-            "max_tokens": 1024,
-            # Важно: отключаем "размышления" модели, чтобы не тратить токены [citation:6]
-            "chat_template_kwargs": {"enable_thinking": False}
-        }
-        
-        data = json.dumps(payload).encode('utf-8')
-        req = urllib.request.Request(
-            BILIBILI_API_URL, 
-            data=data, 
-            headers={'Content-Type': 'application/json'}
-        )
-        
-        with urllib.request.urlopen(req, timeout=15) as response:
-            result = json.loads(response.read().decode('utf-8'))
-            # Извлекаем текст из ответа, как в примере OpenAI
-            return result['choices'][0]['message']['content'].strip()
-            
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            result = json.loads(resp.read().decode("utf-8"))
+        return result["choices"][0]["message"]["content"].strip()
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="ignore")
+        logging.warning(f"Bilibili HTTP {e.code}: {body[:200]}")
+        return ""
     except Exception as e:
-        logging.warning(f"Bilibili Translate error: {e}")
-        return None
+        logging.warning(f"Bilibili error: {e}")
+        return ""
 
 
 async def get_variants(text: str, target: str):
+    """Вызывает API B站, возвращает один результат перевода"""
     variants = []
-    result = await asyncio.to_thread(translate_bilibili, text, target)
+    result = await asyncio.to_thread(bilibili_translate, text, target)
     if result:
-        variants.append(("Bilibili LLM", result))
+        variants.append(("Index-Translate", result))
     return variants
 
 
-# ---------------- ХЕНДЛЕРЫ ----------------
+# ---------------- ОБРАБОТЧИКИ ----------------
 
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
     user_lang[message.from_user.id] = "en"
     await message.answer(
-        "👋 Привет! Я перевожу через <b>Bilibili Index-Translate</b>.\n\n"
+        "👋 Привет! Я перевожу через <b>Bilibili Index-Translate 35B</b>.\n\n"
         "Отправь текст — получишь перевод.\n"
         "/lang — сменить язык"
     )
@@ -137,7 +140,7 @@ async def translate_message(message: Message):
         return
 
     target = user_lang.get(message.from_user.id, "en")
-    # Преобразуем код языка в название для промпта (LLM нужно человеческое название)
+    # Преобразуем код языка в читаемое имя для LLM
     target_name = LANGUAGES.get(target, "English").split(" ", 1)[-1]
 
     await bot.send_chat_action(message.chat.id, "typing")
