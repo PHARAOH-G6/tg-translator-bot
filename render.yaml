@@ -5,7 +5,7 @@ services:
     region: frankfurt
     plan: free
     buildCommand: pip install -r requirements.txt
-    startCommand: python call_api.py & python bot.py
+    startCommand: python bot.py
     envVars:
       - key: BOT_TOKEN
         sync: false
