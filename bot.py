@@ -1,6 +1,8 @@
 import asyncio
 import logging
 import os
+import time
+import random
 
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F
@@ -10,12 +12,12 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
-from deep_translator import MyMemoryTranslator
+from deep_translator import GoogleTranslator, MyMemoryTranslator
 from langdetect import detect, DetectorFactory
 
 # ================== НАСТРОЙКИ ==================
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-# Render даёт RENDER_EXTERNAL_URL автоматически
+MYMEMORY_EMAIL = os.environ.get("MYMEMORY_EMAIL", "")
 WEBHOOK_HOST = os.environ.get("RENDER_EXTERNAL_URL", "")
 WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
 WEBHOOK_URL = f"{WEBHOOK_HOST}{WEBHOOK_PATH}"
@@ -25,22 +27,14 @@ PORT = int(os.environ.get("PORT", 10000))
 DetectorFactory.seed = 0
 
 LANGUAGES = {
-    "ru": "🇷🇺 Русский",
-    "en": "🇬🇧 English",
-    "de": "🇩🇪 Deutsch",
-    "fr": "🇫🇷 Français",
-    "es": "🇪🇸 Español",
-    "it": "🇮🇹 Italiano",
-    "uk": "🇺🇦 Українська",
-    "tr": "🇹🇷 Türkçe",
-    "zh-CN": "🇨🇳 中文",
-    "ja": "🇯🇵 日本語",
+    "ru": "🇷🇺 Русский", "en": "🇬🇧 English", "de": "🇩🇪 Deutsch",
+    "fr": "🇫🇷 Français", "es": "🇪🇸 Español", "it": "🇮🇹 Italiano",
+    "uk": "🇺🇦 Українська", "tr": "🇹🇷 Türkçe", "zh-CN": "🇨🇳 中文", "ja": "🇯🇵 日本語",
 }
 
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
-
 user_lang = {}
 
 
@@ -58,25 +52,54 @@ def lang_keyboard():
 
 # ---------------- ДВИЖКИ ----------------
 
-def translate_mymemory(text: str, target: str) -> str | None:
-    """MyMemory Translator с email для повышения лимита до 50k символов."""
+_google_last_call = 0.0
+GOOGLE_MIN_INTERVAL = 1.1
+
+
+def translate_google(text: str, target: str) -> str | None:
+    """Google через deep-translator, но с двумя попытками и защитой."""
+    global _google_last_call
     try:
-        # Определяем исходный язык, так как MyMemory не умеет 'auto'
+        elapsed = time.time() - _google_last_call
+        if elapsed < GOOGLE_MIN_INTERVAL:
+            time.sleep(GOOGLE_MIN_INTERVAL - elapsed)
+
+        for attempt in range(3):
+            try:
+                result = GoogleTranslator(source="auto", target=target).translate(text)
+                _google_last_call = time.time()
+                return result
+            except Exception as e:
+                if attempt == 2:
+                    logging.warning(f"Google error after retries: {e}")
+                    return None
+                wait = (2 ** attempt) + random.uniform(0.5, 1.5)
+                logging.info(f"Google retry in {wait:.1f}s: {e}")
+                time.sleep(wait)
+        return None
+    except Exception as e:
+        logging.warning(f"Google error: {e}")
+        return None
+
+
+def translate_mymemory(text: str, target: str) -> str | None:
+    """MyMemory только для НЕ-русских исходников."""
+    try:
         source = detect(text)
-        # Приводим коды, которые понимает MyMemory
-        if source == "zh-cn":
+        # Приводим коды langdetect к MyMemory
+        if source.startswith("zh"):
             source = "zh-CN"
-        elif source == "zh-tw":
-            source = "zh-TW"
-        
         if source == target:
             return None
 
-        # MyMemory требует email в параметре 'de' для повышения лимита [citation:2]
+        # MyMemory не умеет с русского — пропускаем
+        if source in ("ru", "uk", "be"):
+            return None
+
         translator = MyMemoryTranslator(
             source=source,
             target=target,
-            email=os.environ.get("MYMEMORY_EMAIL") # Берем email из переменных окружения
+            email=MYMEMORY_EMAIL,
         )
         return translator.translate(text)
     except Exception as e:
@@ -87,6 +110,12 @@ def translate_mymemory(text: str, target: str) -> str | None:
 async def get_variants(text: str, target: str):
     variants = []
     seen = set()
+
+    g = await asyncio.to_thread(translate_google, text, target)
+    if isinstance(g, str) and g.strip():
+        cleaned = g.strip()
+        seen.add(cleaned.lower().strip(" .,!?;:—-"))
+        variants.append(("Google", cleaned))
 
     m = await asyncio.to_thread(translate_mymemory, text, target)
     if isinstance(m, str) and m.strip():
@@ -105,9 +134,8 @@ async def get_variants(text: str, target: str):
 async def cmd_start(message: Message):
     user_lang[message.from_user.id] = "en"
     await message.answer(
-        "👋 Привет! Я перевожу через <b>MyMemory</b>.\n\n"
-        "В личке: отправь текст — получишь перевод.\n"
-        "В группе: упомяни меня (@username).\n\n"
+        "👋 Привет! Я перевожу через <b>Google</b> и <b>MyMemory</b>.\n\n"
+        "Отправь текст — получишь 1–2 варианта перевода.\n"
         "/lang — сменить язык"
     )
 
@@ -118,8 +146,7 @@ async def cmd_help(message: Message):
         "📖 <b>Как пользоваться:</b>\n\n"
         "1. Выбери язык командой /lang\n"
         "2. Отправь текст (в группе — упомяни меня)\n"
-        "3. Получи перевод\n\n"
-        "Исходный язык определяется автоматически."
+        "3. Получи 1–2 варианта перевода"
     )
 
 
@@ -138,11 +165,9 @@ async def on_lang_selected(callback: CallbackQuery):
 
 @dp.message(F.text)
 async def translate_message(message: Message):
-    # В группах бот отвечает только когда его упомянули
     if message.chat.type in ("group", "supergroup"):
         bot_username = (await bot.me()).username
-        mentioned = f"@{bot_username}" in (message.text or "")
-        if not mentioned:
+        if f"@{bot_username}" not in (message.text or ""):
             return
         text = message.text.replace(f"@{bot_username}", "").strip()
     else:
@@ -152,8 +177,8 @@ async def translate_message(message: Message):
         return
 
     target = user_lang.get(message.from_user.id, "en")
-
     await bot.send_chat_action(message.chat.id, "typing")
+
     variants = await get_variants(text, target)
 
     if not variants:
@@ -184,8 +209,8 @@ async def main():
     dp.shutdown.register(on_shutdown)
 
     app = web.Application()
-    webhook_requests_handler = SimpleRequestHandler(dispatcher=dp, bot=bot)
-    webhook_requests_handler.register(app, path=WEBHOOK_PATH)
+    handler = SimpleRequestHandler(dispatcher=dp, bot=bot)
+    handler.register(app, path=WEBHOOK_PATH)
     setup_application(app, dp, bot=bot)
 
     runner = web.AppRunner(app)
