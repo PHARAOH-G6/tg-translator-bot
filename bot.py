@@ -50,7 +50,7 @@ def lang_keyboard():
 # ---------------- ПЕРЕВОД ЧЕРЕЗ POLLINATIONS ----------------
 
 def translate_pollinations(text: str, target_lang: str) -> str:
-    """Перевод через Pollinations с API-ключом."""
+    """Перевод через Pollinations AI с API-ключом."""
     prompt = (
         f"Translate the following text to {target_lang}. "
         f"Output only the translation, without any explanations.\n\n{text}"
@@ -159,6 +159,13 @@ async def translate_message(message: Message):
     await message.reply("\n".join(lines))
 
 
+# ---------------- HEALTH CHECK ДЛЯ CRON-JOB.ORG ----------------
+
+async def health_check(request):
+    """Эндпоинт для cron-job.org. Возвращает 200 OK."""
+    return web.Response(text="OK")
+
+
 # ---------------- WEBHOOK ----------------
 
 async def on_startup(bot: Bot):
@@ -179,6 +186,9 @@ async def main():
     handler = SimpleRequestHandler(dispatcher=dp, bot=bot)
     handler.register(app, path=WEBHOOK_PATH)
     setup_application(app, dp, bot=bot)
+
+    # Эндпоинт /health для cron-job.org
+    app.router.add_get("/health", health_check)
 
     runner = web.AppRunner(app)
     await runner.setup()
