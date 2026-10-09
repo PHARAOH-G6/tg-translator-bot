@@ -15,12 +15,12 @@ from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_applicati
 
 # ================== НАСТРОЙКИ ==================
 BOT_TOKEN = os.environ["BOT_TOKEN"]
+POLLINATIONS_KEY = os.environ["POLLINATIONS_KEY"]
 WEBHOOK_HOST = os.environ.get("RENDER_EXTERNAL_URL", "")
 WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
 WEBHOOK_URL = f"{WEBHOOK_HOST}{WEBHOOK_PATH}"
 PORT = int(os.environ.get("PORT", 10000))
 
-KEYLESS_API_URL = "https://keylessai.thryx.workers.dev/v1/chat/completions"
 POLLINATIONS_API_URL = "https://gen.pollinations.ai/v1/chat/completions"
 
 LANGUAGES = {
@@ -47,72 +47,50 @@ def lang_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
-# ---------------- ПЕРЕВОД (С ФОЛБЭКОМ) ----------------
+# ---------------- ПЕРЕВОД ЧЕРЕЗ POLLINATIONS ----------------
 
-def translate_via_keyless(text: str, target_lang: str) -> str:
-    """Основной провайдер — KeylessAI"""
-    prompt = f"Translate the following text to {target_lang}. Output only the translation, without explanations.\n\n{text}"
-    payload = {
-        "model": "openai-fast",
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.3,
-    }
-    data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(
-        KEYLESS_API_URL, data=data,
-        headers={"Content-Type": "application/json", "Authorization": "Bearer not-needed"},
-        method="POST"
+def translate_pollinations(text: str, target_lang: str) -> str:
+    """Перевод через Pollinations с API-ключом."""
+    prompt = (
+        f"Translate the following text to {target_lang}. "
+        f"Output only the translation, without any explanations.\n\n{text}"
     )
-    try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            result = json.loads(resp.read().decode("utf-8"))
-        return result["choices"][0]["message"]["content"].strip()
-    except Exception as e:
-        logging.warning(f"KeylessAI failed: {e}")
-        return ""
 
-
-def translate_via_pollinations(text: str, target_lang: str) -> str:
-    """Резервный провайдер — Pollinations"""
-    prompt = f"Translate the following text to {target_lang}. Output only the translation, without explanations.\n\n{text}"
     payload = {
         "model": "openai",
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.3,
     }
+
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
-        POLLINATIONS_API_URL, data=data,
-        headers={"Content-Type": "application/json", "Authorization": "Bearer not-needed"},
-        method="POST"
+        POLLINATIONS_API_URL,
+        data=data,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {POLLINATIONS_KEY}",
+        },
+        method="POST",
     )
+
     try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
+        with urllib.request.urlopen(req, timeout=30) as resp:
             result = json.loads(resp.read().decode("utf-8"))
         return result["choices"][0]["message"]["content"].strip()
-    except Exception as e:
-        logging.warning(f"Pollinations failed: {e}")
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="ignore")
+        logging.warning(f"Pollinations HTTP {e.code}: {body[:200]}")
         return ""
-
-
-def translate_with_fallback(text: str, target_lang: str) -> tuple[str, str]:
-    """Пробует KeylessAI, потом Pollinations. Возвращает (провайдер, перевод)."""
-    result = translate_via_keyless(text, target_lang)
-    if result:
-        return ("KeylessAI", result)
-
-    result = translate_via_pollinations(text, target_lang)
-    if result:
-        return ("Pollinations", result)
-
-    return ("", "")
+    except Exception as e:
+        logging.warning(f"Pollinations error: {e}")
+        return ""
 
 
 async def get_variants(text: str, target: str):
     variants = []
-    provider, result = await asyncio.to_thread(translate_with_fallback, text, target)
+    result = await asyncio.to_thread(translate_pollinations, text, target)
     if result:
-        variants.append((provider, result))
+        variants.append(("Pollinations", result))
     return variants
 
 
@@ -122,7 +100,7 @@ async def get_variants(text: str, target: str):
 async def cmd_start(message: Message):
     user_lang[message.from_user.id] = "en"
     await message.answer(
-        "👋 Привет! Я перевожу через <b>KeylessAI / Pollinations</b>.\n\n"
+        "👋 Привет! Я перевожу через <b>Pollinations AI</b>.\n\n"
         "Отправь текст — получишь перевод.\n"
         "/lang — сменить язык"
     )
