@@ -1,62 +1,70 @@
 #!/usr/bin/env python3
-"""Официальный скрипт вызова API Bilibili Index-Translate (без зависимостей)"""
+"""Локальный прокси для Bilibili Index-Translate API.
+Принимает запросы от бота и пересылает их в B站 с чистыми заголовками."""
 
-import argparse
 import json
-import sys
+import logging
 import urllib.request
+import urllib.error
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
-API_BASE = "https://index-translate.bilibili.com/v1"
-DEFAULT_MODEL = "Index-Translate-35B-A3B"
+BILIBILI_API = "https://index-translate.bilibili.com/v1/chat/completions"
+BILIBILI_MODEL = "Index-Translate-35B-A3B"
+PROXY_PORT = 8080
 
-
-def translate(text, target="en", model=DEFAULT_MODEL, stream=False):
-    """Вызывает API перевода B站, возвращает результат"""
-    url = f"{API_BASE}/chat/completions"
-    
-    # Формируем prompt: перевести напрямую, без объяснений
-    prompt = f"请将以下文本翻译为{target}，直接输出翻译结果，不要进行任何解释。\n\n{text}"
-    
-    payload = {
-        "model": model,
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0,
-        "max_tokens": 1024,
-        "chat_template_kwargs": {"enable_thinking": False}
-    }
-    
-    data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(
-        url,
-        data=data,
-        headers={
-            "Content-Type": "application/json",
-            # Ключевое: полностью имитируем официальный скрипт, не добавляем лишних заголовков
-            "User-Agent": "python-urllib/3.13"
-        },
-        method="POST"
-    )
-    
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            result = json.loads(resp.read().decode("utf-8"))
-        return result["choices"][0]["message"]["content"].strip()
-    except urllib.error.HTTPError as e:
-        return f"[HTTP Error {e.code}] {e.read().decode('utf-8', errors='ignore')[:200]}"
-    except Exception as e:
-        return f"[Error] {e}"
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [proxy] %(message)s")
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Bilibili Index-Translate CLI")
-    parser.add_argument("text", help="Текст для перевода")
-    parser.add_argument("-t", "--target", default="en", help="Целевой язык (по умолчанию: en)")
-    parser.add_argument("-m", "--model", default=DEFAULT_MODEL, help="Имя модели")
-    args = parser.parse_args()
-    
-    result = translate(args.text, args.target, args.model)
-    print(result)
+class ProxyHandler(BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        # Подавляем стандартные логи http.server, чтобы не засорять
+        pass
+
+    def do_POST(self):
+        try:
+            # Читаем запрос от бота
+            length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(length)
+            data = json.loads(body.decode("utf-8"))
+
+            # Формируем запрос к B站
+            payload = json.dumps({
+                "model": BILIBILI_MODEL,
+                "messages": data.get("messages", []),
+                "temperature": 0,
+                "max_tokens": 1024,
+                "chat_template_kwargs": {"enable_thinking": False}
+            }).encode("utf-8")
+
+            req = urllib.request.Request(
+                BILIBILI_API,
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST"
+            )
+
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                result = resp.read()
+                logging.info("Успешный перевод через B站")
+
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(result)
+
+        except urllib.error.HTTPError as e:
+            logging.warning(f"B站 вернул HTTP {e.code}")
+            self.send_response(e.code)
+            self.end_headers()
+            self.wfile.write(e.read())
+        except Exception as e:
+            logging.exception(f"Ошибка прокси: {e}")
+            self.send_response(500)
+            self.end_headers()
+            self.wfile.write(str(e).encode("utf-8"))
 
 
 if __name__ == "__main__":
-    main()
+    server = HTTPServer(("0.0.0.0", PROXY_PORT), ProxyHandler)
+    logging.info(f"Прокси-сервер запущен на порту {PROXY_PORT}")
+    server.serve_forever()
