@@ -1,8 +1,6 @@
 import asyncio
 import logging
 import os
-import time
-import random
 
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F
@@ -12,12 +10,11 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
-from deep_translator import GoogleTranslator
+from deep_translator import MyMemoryTranslator
 from langdetect import detect, DetectorFactory
 
 # ================== НАСТРОЙКИ ==================
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-DEEPL_KEY = os.environ.get("DEEPL_KEY", "")
 # Render даёт RENDER_EXTERNAL_URL автоматически
 WEBHOOK_HOST = os.environ.get("RENDER_EXTERNAL_URL", "")
 WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
@@ -44,7 +41,6 @@ logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
-# Глобальное хранилище выбранного языка: {user_id: lang_code}
 user_lang = {}
 
 
@@ -62,37 +58,29 @@ def lang_keyboard():
 
 # ---------------- ДВИЖКИ ----------------
 
-_google_last_call = 0.0
-GOOGLE_MIN_INTERVAL = 1.1
-
-
-def translate_google(text: str, target: str) -> str | None:
-    global _google_last_call
+def translate_mymemory(text: str, target: str) -> str | None:
+    """MyMemory Translator с email для повышения лимита до 50k символов."""
     try:
-        elapsed = time.time() - _google_last_call
-        if elapsed < GOOGLE_MIN_INTERVAL:
-            time.sleep(GOOGLE_MIN_INTERVAL - elapsed)
+        # Определяем исходный язык, так как MyMemory не умеет 'auto'
+        source = detect(text)
+        # Приводим коды, которые понимает MyMemory
+        if source == "zh-cn":
+            source = "zh-CN"
+        elif source == "zh-tw":
+            source = "zh-TW"
+        
+        if source == target:
+            return None
 
-        last_error = None
-        for attempt in range(3):
-            try:
-                result = GoogleTranslator(source="auto", target=target).translate(text)
-                _google_last_call = time.time()
-                return result
-            except Exception as e:
-                last_error = e
-                msg = str(e).lower()
-                if "too many requests" in msg or "429" in msg:
-                    wait = (2 ** attempt) + random.uniform(0.5, 1.5)
-                    logging.info(f"Google rate limit, ждём {wait:.1f} сек...")
-                    time.sleep(wait)
-                    continue
-                raise
-
-        logging.warning(f"Google error after retries: {last_error}")
-        return None
+        # MyMemory требует email в параметре 'de' для повышения лимита [citation:2]
+        translator = MyMemoryTranslator(
+            source=source,
+            target=target,
+            email=os.environ.get("MYMEMORY_EMAIL") # Берем email из переменных окружения
+        )
+        return translator.translate(text)
     except Exception as e:
-        logging.warning(f"Google error: {e}")
+        logging.warning(f"MyMemory error: {e}")
         return None
 
 
@@ -100,11 +88,13 @@ async def get_variants(text: str, target: str):
     variants = []
     seen = set()
 
-    g = await asyncio.to_thread(translate_google, text, target)
-    if isinstance(g, str) and g.strip():
-        cleaned = g.strip()
-        seen.add(cleaned.lower().strip(" .,!?;:—-"))
-        variants.append(("Google", cleaned))
+    m = await asyncio.to_thread(translate_mymemory, text, target)
+    if isinstance(m, str) and m.strip():
+        cleaned = m.strip()
+        key = cleaned.lower().strip(" .,!?;:—-")
+        if key not in seen:
+            seen.add(key)
+            variants.append(("MyMemory", cleaned))
 
     return variants
 
@@ -115,9 +105,9 @@ async def get_variants(text: str, target: str):
 async def cmd_start(message: Message):
     user_lang[message.from_user.id] = "en"
     await message.answer(
-        "👋 Привет! Я перевожу через <b>Google</b>.\n\n"
+        "👋 Привет! Я перевожу через <b>MyMemory</b>.\n\n"
         "В личке: отправь текст — получишь перевод.\n"
-        "В группе: упомяни меня (@username) или используй /lang и /help.\n\n"
+        "В группе: упомяни меня (@username).\n\n"
         "/lang — сменить язык"
     )
 
@@ -154,7 +144,6 @@ async def translate_message(message: Message):
         mentioned = f"@{bot_username}" in (message.text or "")
         if not mentioned:
             return
-        # Убираем упоминание из текста
         text = message.text.replace(f"@{bot_username}", "").strip()
     else:
         text = message.text.strip()
