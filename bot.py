@@ -1,9 +1,8 @@
 import asyncio
 import logging
 import os
-import time
-import random
-import requests
+import json
+import urllib.request
 
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F
@@ -13,18 +12,15 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
-from langdetect import detect, DetectorFactory
-
 # ================== НАСТРОЙКИ ==================
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-DEEPLX_API_URL = os.environ.get("DEEPLX_API_URL", "https://api.deeplx.org/translate")
+# URL бесплатного API Bilibili Index-Translate
+BILIBILI_API_URL = "https://index-translate.bilibili.com/v1/chat/completions"
 WEBHOOK_HOST = os.environ.get("RENDER_EXTERNAL_URL", "")
 WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
 WEBHOOK_URL = f"{WEBHOOK_HOST}{WEBHOOK_PATH}"
 PORT = int(os.environ.get("PORT", 10000))
 # ===============================================
-
-DetectorFactory.seed = 0
 
 LANGUAGES = {
     "ru": "🇷🇺 Русский", "en": "🇬🇧 English", "de": "🇩🇪 Deutsch",
@@ -50,71 +46,45 @@ def lang_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
-# ---------------- ДВИЖОК DEEPLX ----------------
+# ---------------- ДВИЖОК BILIBILI ----------------
 
-_deeplx_last_call = 0.0
-DEEPLX_MIN_INTERVAL = 1.5  # Пауза, чтобы не поймать 429
-
-
-def translate_deeplx(text: str, target: str) -> list[str]:
-    """Перевод через DeepLX с запросом вариантов."""
-    global _deeplx_last_call
+def translate_bilibili(text: str, target: str) -> str | None:
+    """Перевод через бесплатный API Bilibili Index-Translate."""
     try:
-        # Пауза между запросами
-        elapsed = time.time() - _deeplx_last_call
-        if elapsed < DEEPLX_MIN_INTERVAL:
-            time.sleep(DEEPLX_MIN_INTERVAL - elapsed)
-
-        # DeepLX использует коды вида EN, RU, DE
-        target_code = {"zh-CN": "ZH"}.get(target, target.upper())
+        # Формируем промпт, как в официальном примере [citation:1]
+        prompt = f"请将以下文本翻译为{target}，直接输出翻译结果。\n\n{text}"
         
         payload = {
-            "text": text,
-            "source_lang": "auto",
-            "target_lang": target_code
+            "model": "Index-Translate-35B-A3B",
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0,
+            "max_tokens": 1024,
+            # Важно: отключаем "размышления" модели, чтобы не тратить токены [citation:6]
+            "chat_template_kwargs": {"enable_thinking": False}
         }
         
-        # Запрашиваем 3 варианта перевода
-        response = requests.post(DEEPLX_API_URL, json=payload, timeout=15)
-        response.raise_for_status()
-        data = response.json()
+        data = json.dumps(payload).encode('utf-8')
+        req = urllib.request.Request(
+            BILIBILI_API_URL, 
+            data=data, 
+            headers={'Content-Type': 'application/json'}
+        )
         
-        _deeplx_last_call = time.time()
-        
-        # DeepLX возвращает основной перевод в 'data' и варианты в 'alternatives'
-        results = [data.get("data")]
-        if "alternatives" in data:
-            results.extend(data["alternatives"])
-        
-        # Убираем пустые и дубликаты
-        seen = set()
-        unique_results = []
-        for r in results:
-            if isinstance(r, str) and r.strip():
-                key = r.lower().strip()
-                if key not in seen:
-                    seen.add(key)
-                    unique_results.append(r.strip())
-        
-        return unique_results
-
+        with urllib.request.urlopen(req, timeout=15) as response:
+            result = json.loads(response.read().decode('utf-8'))
+            # Извлекаем текст из ответа, как в примере OpenAI
+            return result['choices'][0]['message']['content'].strip()
+            
     except Exception as e:
-        logging.warning(f"DeepLX error: {e}")
-        return []
+        logging.warning(f"Bilibili Translate error: {e}")
+        return None
 
 
 async def get_variants(text: str, target: str):
     variants = []
-    seen = set()
-
-    results = await asyncio.to_thread(translate_deeplx, text, target)
-    
-    for r in results:
-        key = r.lower().strip(" .,!?;:—-")
-        if key not in seen:
-            seen.add(key)
-            variants.append(("DeepLX", r))
-
+    result = await asyncio.to_thread(translate_bilibili, text, target)
+    if result:
+        variants.append(("Bilibili LLM", result))
     return variants
 
 
@@ -124,8 +94,8 @@ async def get_variants(text: str, target: str):
 async def cmd_start(message: Message):
     user_lang[message.from_user.id] = "en"
     await message.answer(
-        "👋 Привет! Я перевожу через <b>DeepLX</b>.\n\n"
-        "Отправь текст — получишь до 3 вариантов перевода.\n"
+        "👋 Привет! Я перевожу через <b>Bilibili Index-Translate</b>.\n\n"
+        "Отправь текст — получишь перевод.\n"
         "/lang — сменить язык"
     )
 
@@ -136,7 +106,7 @@ async def cmd_help(message: Message):
         "📖 <b>Как пользоваться:</b>\n\n"
         "1. Выбери язык командой /lang\n"
         "2. Отправь текст (в группе — упомяни меня)\n"
-        "3. Получи до 3 вариантов перевода"
+        "3. Получи перевод"
     )
 
 
@@ -167,17 +137,19 @@ async def translate_message(message: Message):
         return
 
     target = user_lang.get(message.from_user.id, "en")
-    await bot.send_chat_action(message.chat.id, "typing")
+    # Преобразуем код языка в название для промпта (LLM нужно человеческое название)
+    target_name = LANGUAGES.get(target, "English").split(" ", 1)[-1]
 
-    variants = await get_variants(text, target)
+    await bot.send_chat_action(message.chat.id, "typing")
+    variants = await get_variants(text, target_name)
 
     if not variants:
         await message.reply("⚠️ Не удалось перевести. Попробуй позже или смени язык (/lang).")
         return
 
     lines = [f"🌍 <b>{LANGUAGES.get(target, target)}</b>\n"]
-    for i, (name, translated) in enumerate(variants, 1):
-        lines.append(f"<b>Вариант {i}:</b>\n{translated}\n")
+    for name, translated in variants:
+        lines.append(f"<b>{name}:</b>\n{translated}\n")
 
     await message.reply("\n".join(lines))
 
