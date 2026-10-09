@@ -3,6 +3,7 @@ import logging
 import os
 import time
 import random
+import requests
 
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F
@@ -12,12 +13,11 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
-from deep_translator import GoogleTranslator, MyMemoryTranslator
 from langdetect import detect, DetectorFactory
 
 # ================== НАСТРОЙКИ ==================
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-MYMEMORY_EMAIL = os.environ.get("MYMEMORY_EMAIL", "")
+DEEPLX_API_URL = os.environ.get("DEEPLX_API_URL", "https://api.deeplx.org/translate")
 WEBHOOK_HOST = os.environ.get("RENDER_EXTERNAL_URL", "")
 WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
 WEBHOOK_URL = f"{WEBHOOK_HOST}{WEBHOOK_PATH}"
@@ -50,80 +50,70 @@ def lang_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
-# ---------------- ДВИЖКИ ----------------
+# ---------------- ДВИЖОК DEEPLX ----------------
 
-_google_last_call = 0.0
-GOOGLE_MIN_INTERVAL = 1.1
+_deeplx_last_call = 0.0
+DEEPLX_MIN_INTERVAL = 1.5  # Пауза, чтобы не поймать 429
 
 
-def translate_google(text: str, target: str) -> str | None:
-    """Google через deep-translator, но с двумя попытками и защитой."""
-    global _google_last_call
+def translate_deeplx(text: str, target: str) -> list[str]:
+    """Перевод через DeepLX с запросом вариантов."""
+    global _deeplx_last_call
     try:
-        elapsed = time.time() - _google_last_call
-        if elapsed < GOOGLE_MIN_INTERVAL:
-            time.sleep(GOOGLE_MIN_INTERVAL - elapsed)
+        # Пауза между запросами
+        elapsed = time.time() - _deeplx_last_call
+        if elapsed < DEEPLX_MIN_INTERVAL:
+            time.sleep(DEEPLX_MIN_INTERVAL - elapsed)
 
-        for attempt in range(3):
-            try:
-                result = GoogleTranslator(source="auto", target=target).translate(text)
-                _google_last_call = time.time()
-                return result
-            except Exception as e:
-                if attempt == 2:
-                    logging.warning(f"Google error after retries: {e}")
-                    return None
-                wait = (2 ** attempt) + random.uniform(0.5, 1.5)
-                logging.info(f"Google retry in {wait:.1f}s: {e}")
-                time.sleep(wait)
-        return None
+        # DeepLX использует коды вида EN, RU, DE
+        target_code = {"zh-CN": "ZH"}.get(target, target.upper())
+        
+        payload = {
+            "text": text,
+            "source_lang": "auto",
+            "target_lang": target_code
+        }
+        
+        # Запрашиваем 3 варианта перевода
+        response = requests.post(DEEPLX_API_URL, json=payload, timeout=15)
+        response.raise_for_status()
+        data = response.json()
+        
+        _deeplx_last_call = time.time()
+        
+        # DeepLX возвращает основной перевод в 'data' и варианты в 'alternatives'
+        results = [data.get("data")]
+        if "alternatives" in data:
+            results.extend(data["alternatives"])
+        
+        # Убираем пустые и дубликаты
+        seen = set()
+        unique_results = []
+        for r in results:
+            if isinstance(r, str) and r.strip():
+                key = r.lower().strip()
+                if key not in seen:
+                    seen.add(key)
+                    unique_results.append(r.strip())
+        
+        return unique_results
+
     except Exception as e:
-        logging.warning(f"Google error: {e}")
-        return None
-
-
-def translate_mymemory(text: str, target: str) -> str | None:
-    """MyMemory только для НЕ-русских исходников."""
-    try:
-        source = detect(text)
-        # Приводим коды langdetect к MyMemory
-        if source.startswith("zh"):
-            source = "zh-CN"
-        if source == target:
-            return None
-
-        # MyMemory не умеет с русского — пропускаем
-        if source in ("ru", "uk", "be"):
-            return None
-
-        translator = MyMemoryTranslator(
-            source=source,
-            target=target,
-            email=MYMEMORY_EMAIL,
-        )
-        return translator.translate(text)
-    except Exception as e:
-        logging.warning(f"MyMemory error: {e}")
-        return None
+        logging.warning(f"DeepLX error: {e}")
+        return []
 
 
 async def get_variants(text: str, target: str):
     variants = []
     seen = set()
 
-    g = await asyncio.to_thread(translate_google, text, target)
-    if isinstance(g, str) and g.strip():
-        cleaned = g.strip()
-        seen.add(cleaned.lower().strip(" .,!?;:—-"))
-        variants.append(("Google", cleaned))
-
-    m = await asyncio.to_thread(translate_mymemory, text, target)
-    if isinstance(m, str) and m.strip():
-        cleaned = m.strip()
-        key = cleaned.lower().strip(" .,!?;:—-")
+    results = await asyncio.to_thread(translate_deeplx, text, target)
+    
+    for r in results:
+        key = r.lower().strip(" .,!?;:—-")
         if key not in seen:
             seen.add(key)
-            variants.append(("MyMemory", cleaned))
+            variants.append(("DeepLX", r))
 
     return variants
 
@@ -134,8 +124,8 @@ async def get_variants(text: str, target: str):
 async def cmd_start(message: Message):
     user_lang[message.from_user.id] = "en"
     await message.answer(
-        "👋 Привет! Я перевожу через <b>Google</b> и <b>MyMemory</b>.\n\n"
-        "Отправь текст — получишь 1–2 варианта перевода.\n"
+        "👋 Привет! Я перевожу через <b>DeepLX</b>.\n\n"
+        "Отправь текст — получишь до 3 вариантов перевода.\n"
         "/lang — сменить язык"
     )
 
@@ -146,7 +136,7 @@ async def cmd_help(message: Message):
         "📖 <b>Как пользоваться:</b>\n\n"
         "1. Выбери язык командой /lang\n"
         "2. Отправь текст (в группе — упомяни меня)\n"
-        "3. Получи 1–2 варианта перевода"
+        "3. Получи до 3 вариантов перевода"
     )
 
 
@@ -186,8 +176,8 @@ async def translate_message(message: Message):
         return
 
     lines = [f"🌍 <b>{LANGUAGES.get(target, target)}</b>\n"]
-    for name, translated in variants:
-        lines.append(f"<b>{name}:</b>\n{translated}\n")
+    for i, (name, translated) in enumerate(variants, 1):
+        lines.append(f"<b>Вариант {i}:</b>\n{translated}\n")
 
     await message.reply("\n".join(lines))
 
